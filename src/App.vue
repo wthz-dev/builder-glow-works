@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 // ===== Types =====
 interface MenuItem {
@@ -10,6 +11,36 @@ interface MenuItem {
   category: string
   soldOut?: boolean
 }
+
+// Helpers for Orders panel
+function statusTh(s: string) {
+  const m: Record<string, string> = {
+    New: 'รับออเดอร์แล้ว',
+    Cooking: 'กำลังทำ',
+    Served: 'เสิร์ฟแล้ว',
+    Canceled: 'ยกเลิก',
+    Paid: 'ชำระแล้ว',
+  }
+  return m[s] || s
+}
+function formatTime(ts?: number) {
+  if (!ts) return ''
+  try {
+    return new Date(ts).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return ''
+  }
+}
+
+// Migration will run after orders are initialized
+
+// (routing migration in progress)
+
+// Minimal stubs to satisfy existing template refs while we move print UI to its own route
+const ownerPrintOpen = ref(false)
+function openPrintPosters() { router.push('/owner/print') }
+function closePrintPosters() { ownerPrintOpen.value = false }
+function triggerPrint() { window.print() }
 
 interface CartItem {
   id: string
@@ -27,6 +58,7 @@ interface CartItem {
 
 interface Order {
   id: string
+  orderNo: string
   table: string
   items: CartItem[]
   total: number
@@ -42,8 +74,55 @@ interface TableInfo {
 
 // ===== Brand / Context =====
 const brandName = 'ร้านก๋วยเตี๋ยวเส้นทอง'
-const urlParams = new URLSearchParams(window.location.search)
-const table = urlParams.get('table') || '-'
+const TABLE_COUNT = 20
+const tableRef = ref<string>('-')
+const table = computed(() => tableRef.value)
+
+function isValidTable(no: string) {
+  const n = Number(no)
+  return Number.isInteger(n) && n >= 1 && n <= TABLE_COUNT
+}
+
+function setTable(no: string) {
+  tableRef.value = no
+  try {
+    localStorage.setItem('noodle_current_table', no)
+  } catch {}
+  const url = new URL(window.location.href)
+  url.searchParams.set('table', no)
+  history.replaceState({}, '', url.toString())
+}
+
+const tablePromptOpen = ref(false)
+const tableInput = ref<string | number>('')
+
+function ensureTable() {
+  const url = new URL(window.location.href)
+  const fromUrl = url.searchParams.get('table')
+  let candidate = fromUrl || null
+  if (!candidate) {
+    try {
+      candidate = localStorage.getItem('noodle_current_table')
+    } catch {}
+  }
+  if (candidate && isValidTable(candidate)) {
+    setTable(String(Number(candidate)))
+  } else {
+    tablePromptOpen.value = true
+  }
+}
+
+function confirmTable() {
+  const raw = tableInput.value as unknown
+  const val = String(typeof raw === 'number' ? Math.trunc(raw as number) : (raw ?? ''))
+    .trim()
+  if (!isValidTable(val)) {
+    toast(`กรุณาใส่เลขโต๊ะ 1–${TABLE_COUNT}`)
+    return
+  }
+  setTable(String(Number(val)))
+  tablePromptOpen.value = false
+}
 
 // ===== Category / Menu =====
 const categories = [
@@ -150,7 +229,7 @@ const form = reactive({
 })
 
 function openDetail(item: MenuItem) {
-  if (item.soldOut) return
+  if (item.soldOut || isLockedForOrdering.value) return
   detailItem.value = item
   Object.assign(form, {
     noodle: 'เส้นเล็ก',
@@ -170,6 +249,10 @@ function toggleTopping(t: string) {
 }
 
 function addToCart() {
+  if (isLockedForOrdering.value) {
+    toast('ออเดอร์นี้ชำระแล้ว ไม่สามารถสั่งเพิ่มได้')
+    return
+  }
   if (!detailItem.value) return
   const id = `${detailItem.value.id}-${form.noodle}-${form.soup}-${form.spice}-${[...form.toppings].sort().join('.')}-${form.note}`
   const existing = cart.value.find((c) => c.id === id)
@@ -225,10 +308,54 @@ const orderId = ref('')
 const orders = reactive<Order[]>(loadLocal<Order[]>('noodle_orders', []))
 watch(orders, () => localStorage.setItem('noodle_orders', JSON.stringify(orders)), { deep: true })
 
+// Run migration now that orders exist
+;(function migrateOrderNos() {
+  const byOldest = orders.slice().sort((a, b) => a.createdAt - b.createdAt)
+  const seqPerDay: Record<string, number> = {}
+  for (const o of byOldest) {
+    const d = new Date(o.createdAt)
+    const yy = String(d.getFullYear()).slice(-2)
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    const datePart = `${yy}${mm}${dd}`
+    if (!o.orderNo) {
+      const key = `noodle_order_seq_${datePart}`
+      const current = (seqPerDay[datePart] ?? Number(localStorage.getItem(key) || '0')) + 1
+      seqPerDay[datePart] = current
+      o.orderNo = `${datePart}-${String(current).padStart(3, '0')}`
+    } else {
+      const match = o.orderNo.match(/^(\d{6})-(\d{3,})$/)
+      if (match) {
+        const dp = match[1]
+        const num = Number(match[2])
+        seqPerDay[dp] = Math.max(seqPerDay[dp] ?? 0, num)
+      }
+    }
+  }
+  for (const [datePart, n] of Object.entries(seqPerDay)) {
+    const key = `noodle_order_seq_${datePart}`
+    const prev = Number(localStorage.getItem(key) || '0')
+    if (n > prev) localStorage.setItem(key, String(n))
+  }
+})()
+
+// Global running order number per day: YYMMDD-XXX (e.g., 250902-001)
+function nextOrderNo(): string {
+  const now = new Date()
+  const yy = String(now.getFullYear()).slice(-2)
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  const datePart = `${yy}${mm}${dd}`
+  const key = `noodle_order_seq_${datePart}`
+  const current = Number(localStorage.getItem(key) || '0') + 1
+  localStorage.setItem(key, String(current))
+  return `${datePart}-${String(current).padStart(3, '0')}`
+}
+
 const tables = reactive<TableInfo[]>(
   loadLocal<TableInfo[]>(
     'noodle_tables',
-    Array.from({ length: 12 }).map((_, i) => ({ no: i + 1, status: 'VACANT' }) as TableInfo),
+    Array.from({ length: TABLE_COUNT }).map((_, i) => ({ no: i + 1, status: 'VACANT' }) as TableInfo),
   ),
 )
 watch(tables, () => localStorage.setItem('noodle_tables', JSON.stringify(tables)), { deep: true })
@@ -237,30 +364,98 @@ function openCart() {
   checkoutStep.value = 'cart'
   showCart.value = true
 }
+// Start billing: aggregate all unpaid orders for this table into one payment
+function startBilling() {
+  checkoutStep.value = 'payment'
+  showCart.value = true
+  paymentStatus.value = 'pending'
+}
+// Keep legacy function used by template (opens cart read-only when all paid)
+function openCartLocked() {
+  checkoutStep.value = 'cart'
+  showCart.value = true
+}
+
+// Multi-order: allow ordering while there are unpaid orders.
+// Lock only if there is at least one order and all are paid.
+const unpaidOrdersForTable = computed(() =>
+  orders.filter((o) => o.table === String(table.value) && o.status !== 'Paid'),
+)
+const hasAnyOrderForTable = computed(() =>
+  orders.some((o) => o.table === String(table.value)),
+)
+const isLockedForOrdering = computed(
+  () => hasAnyOrderForTable.value && unpaidOrdersForTable.value.length === 0,
+)
+// Legacy shim: previously toggled an override; now simply inform the user
+function startAdditionalOrder() {
+  toast('เริ่มสั่งเพิ่มได้เลย')
+}
+
+function closeTableForNewCustomer() {
+  if (!confirm('ปิดโต๊ะและเตรียมสำหรับลูกค้าใหม่?')) return
+  // Clear current cart
+  cart.value = []
+  // Mark table as VACANT
+  const idx = Number(table.value) - 1
+  if (!Number.isNaN(idx) && tables[idx]) tables[idx].status = 'VACANT'
+  toast('ปิดโต๊ะเรียบร้อย พร้อมรับลูกค้าใหม่')
+}
 
 function orderNow() {
   if (!cart.value.length) return toast('โปรดเลือกเมนูก่อน')
-  checkoutStep.value = 'payment'
-  const id = `T${String(table).padStart(2, '0')}-${Date.now().toString().slice(-6)}`
+  const id = `T${String(table.value).padStart(2, '0')}-${Date.now().toString().slice(-6)}`
   orderId.value = id
   orders.unshift({
     id,
-    table: String(table),
+    orderNo: nextOrderNo(),
+    table: String(table.value),
     items: JSON.parse(JSON.stringify(cart.value)),
     total: total.value,
     status: 'New',
     createdAt: Date.now(),
   })
-  const t = tables.find((t) => String(t.no) === String(table))
+  const t = tables.find((t) => String(t.no) === String(table.value))
   if (t) t.status = 'ORDERING'
+  // Clear cart and close sheet; payment only via "เช็คบิล"
+  cart.value = []
+  showCart.value = false
+  checkoutStep.value = 'cart'
+  toast('ส่งออเดอร์แล้ว')
 }
 
-const qrUrl = computed(
-  () =>
-    `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
-      `ร้าน:${brandName}|โต๊ะ:${table}|ออเดอร์:${orderId.value}|ยอด:${total.value}`,
-    )}`,
+const unpaidTotalForTable = computed(() =>
+  unpaidOrdersForTable.value.reduce((a, o) => a + (o.total || 0), 0),
 )
+const payAmount = computed(() =>
+  checkoutStep.value === 'payment' ? unpaidTotalForTable.value : total.value,
+)
+const qrUrl = computed(() =>
+  `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+    `${brandName} โต๊ะ ${table.value} ชำระเงิน ฿${payAmount.value}`,
+  )}`,
+)
+
+// Orders panel: show placed orders and statuses for current table
+const showOrdersPanel = ref(false)
+const ordersForTable = computed(() =>
+  orders.filter((o) => String(o.table) === String(table.value)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)),
+)
+const ordersByStatus = computed(() => {
+  const buckets: Record<'New' | 'Cooking' | 'Served' | 'Canceled' | 'Paid', typeof ordersForTable.value> = {
+    New: [],
+    Cooking: [],
+    Served: [],
+    Canceled: [],
+    Paid: [],
+  }
+  for (const o of ordersForTable.value) {
+    if (buckets[o.status as keyof typeof buckets]) buckets[o.status as keyof typeof buckets].push(o)
+  }
+  return buckets
+})
+function openOrdersPanel() { showOrdersPanel.value = true }
+function closeOrdersPanel() { showOrdersPanel.value = false }
 
 function onSlipSelected(e: Event) {
   const input = e.target as HTMLInputElement
@@ -269,23 +464,147 @@ function onSlipSelected(e: Event) {
     slipName.value = file.name
     paymentStatus.value = 'pending'
     checkoutStep.value = 'status'
-    const o = orders.find((o) => o.id === orderId.value)
-    if (o) o.slipName = file.name
+    // Attach slip to all unpaid orders for this table (aggregated bill)
+    const tableStr = String(table.value)
+    for (const o of orders) {
+      if (o.table === tableStr && o.status !== 'Paid') o.slipName = file.name
+    }
   }
 }
 
 function markPaid() {
   paymentStatus.value = 'paid'
   checkoutStep.value = 'status'
-  const o = orders.find((o) => o.id === orderId.value)
-  if (o) o.status = 'Paid'
-  const t = tables.find((t) => String(t.no) === String(table))
+  // Mark all unpaid orders for this table as Paid (one-time bill)
+  const tableStr = String(table.value)
+  for (const o of orders) {
+    if (o.table === tableStr && o.status !== 'Paid') o.status = 'Paid'
+  }
+  const t = tables.find((t) => String(t.no) === tableStr)
   if (t) t.status = 'EATING'
+}
+
+// Latest order per table and lock flag after payment
+const latestOrderForTable = computed(() => {
+  const list = orders
+    .filter((o) => o.table === String(table.value))
+    .slice()
+    .sort((a, b) => b.createdAt - a.createdAt)
+  return list[0] || null
+})
+const hasPaidOrderForTable = computed(() => {
+  const o = latestOrderForTable.value
+  return !!o && (o.status === 'Paid' || o.status === 'Cooking' || o.status === 'Served')
+})
+
+// ===== Owner: Table Links & QR Helpers =====
+function getTableLink(no: number) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('table', String(no))
+  return url.toString()
+}
+
+function getTableQR(no: number) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+    getTableLink(no),
+  )}`
+}
+
+async function copyLink(no: number) {
+  try {
+    await navigator.clipboard.writeText(getTableLink(no))
+    toast(`คัดลอกลิงก์โต๊ะ ${no} แล้ว`)
+  } catch {
+    toast('คัดลอกไม่สำเร็จ')
+  }
+}
+
+function openLink(no: number) {
+  window.open(getTableLink(no), '_blank')
+}
+
+function downloadQR(no: number) {
+  const a = document.createElement('a')
+  a.href = getTableQR(no)
+  a.download = `table-${no}-qr.png`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 
 // ===== Owner: UI State =====
 const ownerOpen = ref(false)
 const ownerTab = ref<'dashboard' | 'menu'>('dashboard')
+
+// Owner Login (PIN)
+const ownerLoggedIn = ref(false)
+const ownerLoginOpen = ref(false)
+const ownerPassInput = ref('')
+const ownerPin = ref('1234')
+
+function loadOwnerAuth() {
+  try {
+    const savedPin = localStorage.getItem('noodle_owner_pin')
+    if (savedPin) ownerPin.value = savedPin
+    const logged = localStorage.getItem('noodle_owner_logged_in') === '1'
+    ownerLoggedIn.value = logged
+  } catch {}
+}
+
+function persistLoggedIn(v: boolean) {
+  try {
+    localStorage.setItem('noodle_owner_logged_in', v ? '1' : '0')
+  } catch {}
+}
+
+function openOwnerPanel() {
+  if (ownerLoggedIn.value) {
+    ownerOpen.value = true
+  } else {
+    ownerPassInput.value = ''
+    ownerLoginOpen.value = true
+  }
+}
+
+function authenticateOwner() {
+  if (ownerPassInput.value === ownerPin.value) {
+    ownerLoggedIn.value = true
+    persistLoggedIn(true)
+    ownerLoginOpen.value = false
+    ownerOpen.value = true
+  } else {
+    toast('รหัสไม่ถูกต้อง')
+  }
+}
+
+function cancelOwnerLogin() {
+  ownerLoginOpen.value = false
+}
+
+function logoutOwner() {
+  ownerLoggedIn.value = false
+  persistLoggedIn(false)
+  ownerOpen.value = false
+}
+
+// Secret long-press to open owner route
+const router = useRouter()
+const secretTimer = ref<number | null>(null)
+function secretPressStart() {
+  if (secretTimer.value) {
+    clearTimeout(secretTimer.value)
+    secretTimer.value = null
+  }
+  secretTimer.value = window.setTimeout(() => {
+    router.push('/owner')
+  }, 1200)
+}
+function secretPressEnd() {
+  if (secretTimer.value) {
+    clearTimeout(secretTimer.value)
+    secretTimer.value = null
+  }
+}
 
 function cycleTableStatus(t: TableInfo) {
   const seq: TableInfo['status'][] = ['VACANT', 'ORDERING', 'EATING', 'BILLING', 'CLEANING']
@@ -410,6 +729,9 @@ const toastMsg = ref('')
 
 onMounted(() => {
   setTimeout(() => (loading.value = false), 600)
+  ensureTable()
+  // init owner auth
+  loadOwnerAuth()
 })
 </script>
 
@@ -418,7 +740,14 @@ onMounted(() => {
     <!-- Header -->
     <header class="sticky top-0 z-40 bg-white/90 backdrop-blur shadow-soft">
       <div class="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
-        <div class="flex items-center gap-3">
+        <div
+          class="flex items-center gap-3 select-none"
+          @mousedown="secretPressStart"
+          @mouseup="secretPressEnd"
+          @mouseleave="secretPressEnd"
+          @touchstart.passive="secretPressStart"
+          @touchend.passive="secretPressEnd"
+        >
           <div
             class="h-9 w-9 rounded-full bg-gradient-to-br from-brand-primary to-broth flex items-center justify-center text-white font-bold shadow"
           >
@@ -431,22 +760,7 @@ onMounted(() => {
             </p>
           </div>
         </div>
-        <button
-          class="inline-flex items-center gap-2 rounded-lg bg-brand-primary px-3 py-2 text-white text-sm font-semibold shadow hover:bg-brand-accent active:scale-[.98]"
-          @click="ownerOpen = true"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill="currentColor"
-            class="w-5 h-5"
-          >
-            <path
-              d="M11.7 2.1a.75.75 0 0 1 .6 0l7.5 3.214a.75.75 0 0 1 .45.69V10.5a9.75 9.75 0 1 1-16.5 6.864V6.004a.75.75 0 0 1 .45-.69L11.7 2.1Z"
-            />
-          </svg>
-          สำหรับเจ้าของ
-        </button>
+        <!-- Hidden owner access: long-press logo (no visible button) -->
       </div>
     </header>
 
@@ -466,6 +780,157 @@ onMounted(() => {
         >
           {{ c }}
         </button>
+      </div>
+    </div>
+
+    <!-- Orders Modal -->
+    <div v-if="showOrdersPanel" class="fixed inset-0 z-50 flex text-[#333] items-center justify-center bg-black/40">
+      <div class="w-full max-w-lg rounded-2xl bg-white p-4 shadow-soft">
+        <div class="flex items-center justify-between mb-2">
+          <div class="text-lg font-extrabold">ออเดอร์ของโต๊ะ {{ table }}</div>
+          <button class="text-slate-600 hover:text-ink" @click="closeOrdersPanel()">ปิด</button>
+        </div>
+        <div v-if="ordersForTable.length === 0" class="text-sm text-slate-500">ยังไม่มีออเดอร์</div>
+        <div v-else class="space-y-3 max-h-[70vh] overflow-y-auto pr-2">
+          <div v-for="o in ordersForTable" :key="o.id" class="rounded-xl border border-slate-200 p-3">
+            <div class="flex items-center justify-between">
+              <div class="font-bold">เลขที่: {{ o.orderNo || o.id }}</div>
+              <div class="text-xs text-slate-600">{{ formatTime(o.createdAt) }}</div>
+            </div>
+            <div class="mt-1 text-sm">
+              สถานะ: <span class="font-semibold">{{ statusTh(o.status) }}</span>
+            </div>
+            <ul class="mt-2 text-sm list-disc pl-5 space-y-1">
+              <li v-for="it in o.items" :key="it.id">
+                {{ it.name }} x{{ it.quantity }}
+                <span v-if="it.options?.note" class="text-slate-500">- {{ it.options.note }}</span>
+              </li>
+            </ul>
+            <div class="mt-2 text-right font-bold">฿{{ o.total }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Print Posters Overlay -->
+    <div v-if="ownerPrintOpen" class="fixed inset-0 z-[60] bg-white overflow-y-auto">
+      <div class="print:hidden sticky top-0 z-10 border-b bg-white">
+        <div class="mx-auto max-w-5xl px-4 py-3 flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="h-9 w-9 rounded-full bg-gradient-to-br from-brand-primary to-broth flex items-center justify-center text-white font-bold shadow">🍜</div>
+            <div>
+              <h2 class="text-lg font-extrabold text-ink">พิมพ์ป้ายโต๊ะ</h2>
+              <p class="text-xs text-slate-500">รวม QR ทั้ง {{ TABLE_COUNT }} โต๊ะ</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button class="rounded-lg border px-3 py-1.5" @click="closePrintPosters">ปิด</button>
+            <button class="rounded-lg bg-brand-primary text-white px-3 py-1.5" @click="triggerPrint">สั่งพิมพ์</button>
+          </div>
+        </div>
+      </div>
+      <div class="mx-auto max-w-5xl px-6 py-6 print:px-0">
+        <div class="grid grid-cols-1 md:grid-cols-2 print-grid-a4">
+          <div
+            v-for="n in TABLE_COUNT"
+            :key="n"
+            class="poster border rounded-2xl p-6 print:p-4 flex flex-col items-center text-center gap-3 print:gap-2 shadow-sm"
+          >
+            <div class="flex items-center gap-3">
+              <div class="h-10 w-10 rounded-full bg-gradient-to-br from-brand-primary to-broth flex items-center justify-center text-white font-bold shadow">🍜</div>
+              <div class="text-left">
+                <div class="text-base print:text-sm font-extrabold text-ink">{{ brandName }}</div>
+                <div class="text-xs print:text-[11px] text-slate-500">สแกนเพื่อสั่งอาหาร</div>
+              </div>
+            </div>
+            <img :src="getTableQR(n)" alt="QR โต๊ะ" class="w-[220px] h-[220px] qr-img" />
+            <div class="text-2xl print:text-xl font-black text-ink">โต๊ะ {{ n }}</div>
+            <div class="text-sm print:text-xs text-slate-600">เปิดกล้อง/แอปแสกน → ไปที่เมนูออนไลน์ของโต๊ะนี้</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom bar: unpaid summary and actions -->
+    <div class="fixed inset-x-0 bottom-0 z-40" v-if="unpaidOrdersForTable.length > 0 || isLockedForOrdering">
+      <div class="mx-auto max-w-5xl p-3">
+        <div class="rounded-2xl bg-ink text-white shadow-soft p-3 flex items-center justify-between gap-2">
+          <template v-if="unpaidOrdersForTable.length > 0">
+            <div class="flex items-center gap-2">
+              <span class="inline-flex h-6 min-w-6 items-center justify-center rounded-full bg-brand-primary px-2 text-xs font-bold">{{ unpaidOrdersForTable.length }}</span>
+              <span class="text-sm">ยอดค้างชำระ</span>
+              <span class="font-extrabold">฿{{ unpaidTotalForTable }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button class="rounded-xl bg-brand-primary px-4 py-2 font-bold hover:bg-brand-accent active:scale-[.98]" @click="startBilling()">
+                เช็คบิล
+              </button>
+              <button class="rounded-xl bg-indigo-600 px-4 py-2 font-bold hover:bg-indigo-500 active:scale-[.98]" @click="openOrdersPanel()">
+                ดูออเดอร์
+              </button>
+              <button class="rounded-xl bg-slate-600 px-4 py-2 font-bold hover:bg-slate-500 active:scale-[.98]" @click="openCart()">
+                ดูตะกร้า
+              </button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="flex items-center gap-2">
+              <span class="inline-flex h-6 min-w-6 items-center justify-center rounded-full bg-green-600 px-2 text-xs font-bold">✓</span>
+              <span class="text-sm">ออเดอร์ชำระแล้ว</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button class="rounded-xl bg-slate-600 px-4 py-2 font-bold hover:bg-slate-500 active:scale-[.98]" @click="closeTableForNewCustomer()">
+                ปิดโต๊ะ
+              </button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Owner Login Modal -->
+    <div
+      v-if="ownerLoginOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+    >
+      <div class="w-full max-w-sm rounded-2xl bg-white p-4 shadow-soft">
+        <h3 class="text-lg font-extrabold text-ink">เข้าสู่ระบบเจ้าของร้าน</h3>
+        <p class="text-sm text-slate-500 mt-1">กรอกรหัส PIN</p>
+        <input
+          v-model="ownerPassInput"
+          type="password"
+          inputmode="numeric"
+          class="mt-3 w-full rounded-lg border border-slate-300 px-3 py-2"
+          placeholder="เช่น 1234"
+          @keyup.enter="authenticateOwner"
+        />
+        <div class="mt-3 flex justify-end gap-2">
+          <button class="rounded-lg border px-3 py-2" @click="cancelOwnerLogin">ยกเลิก</button>
+          <button class="rounded-lg bg-brand-primary text-white px-3 py-2" @click="authenticateOwner">ยืนยัน</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table Prompt Modal -->
+    <div
+      v-if="tablePromptOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+    >
+      <div class="w-full max-w-sm rounded-2xl bg-white p-4 shadow-soft">
+        <h3 class="text-lg font-extrabold text-ink">ระบุหมายเลขโต๊ะ</h3>
+        <p class="text-sm text-slate-500 mt-1">ใส่เลขโต๊ะ 1–{{ TABLE_COUNT }}</p>
+        <input
+          v-model="tableInput"
+          type="number"
+          min="1"
+          :max="TABLE_COUNT"
+          class="mt-3 w-full rounded-lg border border-slate-300 px-3 py-2"
+          placeholder="เช่น 5"
+          @keyup.enter="confirmTable"
+        />
+        <div class="mt-3 flex justify-end gap-2">
+          <button class="rounded-lg border px-3 py-2" @click="confirmTable">ยืนยัน</button>
+        </div>
       </div>
     </div>
 
@@ -511,11 +976,11 @@ onMounted(() => {
                 <button
                   class="rounded-lg px-3 py-1.5 text-sm font-semibold shadow active:scale-[.98]"
                   :class="
-                    item.soldOut
+                    item.soldOut || isLockedForOrdering
                       ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
                       : 'bg-brand-primary text-white hover:bg-brand-accent'
                   "
-                  :disabled="item.soldOut"
+                  :disabled="item.soldOut || isLockedForOrdering"
                   @click="openDetail(item)"
                 >
                   เลือก
@@ -528,7 +993,7 @@ onMounted(() => {
     </main>
 
     <!-- Floating cart bar -->
-    <div class="fixed inset-x-0 bottom-0 z-40" v-if="cartCount > 0">
+    <div class="fixed inset-x-0 bottom-0 z-40" v-if="cartCount > 0 && !isLockedForOrdering">
       <div class="mx-auto max-w-5xl p-3">
         <div
           class="rounded-2xl bg-ink text-white shadow-soft p-3 flex items-center justify-between"
@@ -702,12 +1167,12 @@ onMounted(() => {
 
         <!-- Cart -->
         <div v-if="checkoutStep === 'cart'" class="p-4 space-y-4">
-          <div v-if="!cart.length" class="text-center text-slate-500 py-10">
-            ยังไม่มีสินค้าในตะกร้า
-          </div>
+          <template v-if="isLockedForOrdering && latestOrderForTable">
+            <div class="rounded-xl bg-yellow-50 border border-yellow-200 p-3 text-sm text-yellow-800">
+              ออเดอร์นี้ชำระแล้ว ไม่สามารถสั่งเพิ่มได้
+            </div>
 
-          <div v-for="(c, i) in cart" :key="c.id" class="rounded-xl border p-3 flex gap-3">
-            <div class="flex-1">
+            <div v-for="c in latestOrderForTable.items" :key="c.id" class="rounded-xl border p-3">
               <p class="font-bold text-ink">{{ c.name }}</p>
               <p class="text-xs text-slate-500">
                 {{ c.options.noodle }} • {{ c.options.soup }} • {{ c.options.spice }}
@@ -717,53 +1182,82 @@ onMounted(() => {
               </p>
               <p class="text-xs text-slate-500" v-if="c.options.note">โน้ต: {{ c.options.note }}</p>
               <div class="mt-2 flex items-center justify-between">
-                <div class="flex items-center gap-2">
-                  <button class="h-8 w-8 rounded-full bg-slate-100 font-bold" @click="dec(i)">
-                    -
-                  </button>
-                  <span class="w-6 text-center">{{ c.quantity }}</span>
-                  <button class="h-8 w-8 rounded-full bg-slate-100 font-bold" @click="inc(i)">
-                    +
-                  </button>
-                </div>
+                <span class="text-sm text-slate-600">จำนวน: {{ c.quantity }}</span>
                 <p class="font-bold">฿{{ c.basePrice * c.quantity }}</p>
               </div>
             </div>
-          </div>
 
-          <div class="rounded-xl border p-3 space-y-2">
-            <label class="text-sm font-semibold">โค้ดส่วนลด</label>
-            <div class="flex gap-2">
-              <input
-                v-model="promoCode"
-                placeholder="เช่น SAVE10"
-                class="flex-1 rounded-lg border px-3 py-2"
-              />
-              <button class="rounded-lg border px-4 py-2 font-semibold" @click="applyPromo">
-                ใช้โค้ด
-              </button>
+            <div class="rounded-xl bg-slate-50 p-3 space-y-1">
+              <div class="flex justify-between font-extrabold text-ink text-lg">
+                <span>สุทธิ</span><span>฿{{ latestOrderForTable.total }}</span>
+              </div>
             </div>
-          </div>
+            <div class="text-center text-sm text-slate-500">สถานะ: {{ latestOrderForTable.status }}</div>
+          </template>
+          <template v-else>
+            <div v-if="!cart.length" class="text-center text-slate-500 py-10">
+              ยังไม่มีสินค้าในตะกร้า
+            </div>
 
-          <div class="rounded-xl bg-slate-50 p-3 space-y-1">
-            <div class="flex justify-between text-sm">
-              <span>ยอดรวม</span><span>฿{{ subtotal }}</span>
+            <div v-for="(c, i) in cart" :key="c.id" class="rounded-xl border p-3 flex gap-3">
+              <div class="flex-1">
+                <p class="font-bold text-ink">{{ c.name }}</p>
+                <p class="text-xs text-slate-500">
+                  {{ c.options.noodle }} • {{ c.options.soup }} • {{ c.options.spice }}
+                </p>
+                <p class="text-xs text-slate-500" v-if="c.options.toppings.length">
+                  ท็อปปิ้ง: {{ c.options.toppings.join(', ') }}
+                </p>
+                <p class="text-xs text-slate-500" v-if="c.options.note">โน้ต: {{ c.options.note }}</p>
+                <div class="mt-2 flex items-center justify-between">
+                  <div class="flex items-center gap-2">
+                    <button class="h-8 w-8 rounded-full bg-slate-100 font-bold" @click="dec(i)">
+                      -
+                    </button>
+                    <span class="w-6 text-center">{{ c.quantity }}</span>
+                    <button class="h-8 w-8 rounded-full bg-slate-100 font-bold" @click="inc(i)">
+                      +
+                    </button>
+                  </div>
+                  <p class="font-bold">฿{{ c.basePrice * c.quantity }}</p>
+                </div>
+              </div>
             </div>
-            <div class="flex justify-between text-sm text-green-600">
-              <span>ส่วนลด</span><span>-฿{{ discount }}</span>
-            </div>
-            <div class="flex justify-between font-extrabold text-ink text-lg">
-              <span>สุทธิ</span><span>฿{{ total }}</span>
-            </div>
-          </div>
 
-          <button
-            class="w-full rounded-xl bg-brand-primary px-4 py-3 text-white font-extrabold text-lg shadow disabled:opacity-50"
-            :disabled="!cart.length"
-            @click="orderNow"
-          >
-            สั่งเลย
-          </button>
+            <div class="rounded-xl border p-3 space-y-2">
+              <label class="text-sm font-semibold">โค้ดส่วนลด</label>
+              <div class="flex gap-2">
+                <input
+                  v-model="promoCode"
+                  placeholder="เช่น SAVE10"
+                  class="flex-1 rounded-lg border px-3 py-2"
+                />
+                <button class="rounded-lg border px-4 py-2 font-semibold" @click="applyPromo">
+                  ใช้โค้ด
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl bg-slate-50 p-3 space-y-1">
+              <div class="flex justify-between text-sm">
+                <span>ยอดรวม</span><span>฿{{ subtotal }}</span>
+              </div>
+              <div class="flex justify-between text-sm text-green-600">
+                <span>ส่วนลด</span><span>-฿{{ discount }}</span>
+              </div>
+              <div class="flex justify-between font-extrabold text-ink text-lg">
+                <span>สุทธิ</span><span>฿{{ total }}</span>
+              </div>
+            </div>
+
+            <button
+              class="w-full rounded-xl bg-brand-primary px-4 py-3 text-white font-extrabold text-lg shadow disabled:opacity-50"
+              :disabled="!cart.length"
+              @click="orderNow"
+            >
+              สั่งเลย
+            </button>
+          </template>
         </div>
 
         <!-- Payment -->
@@ -771,8 +1265,10 @@ onMounted(() => {
           <div class="rounded-xl border p-4 text-center">
             <p class="text-sm text-slate-500">สแกนเพื่อชำระยอด</p>
             <img :src="qrUrl" alt="QR" class="mx-auto mt-2 h-56 w-56" />
-            <p class="mt-2 font-extrabold text-ink">฿{{ total }}</p>
-            <p class="text-xs text-slate-500">ออเดอร์: {{ orderId }}</p>
+            <p class="mt-2 font-extrabold text-ink">฿{{ payAmount }}</p>
+            <p class="text-xs text-slate-500" v-if="unpaidOrdersForTable.length > 0">
+              ยอดค้างชำระทั้งหมดของโต๊ะนี้ ({{ unpaidOrdersForTable.length }} ออเดอร์)
+            </p>
           </div>
           <div class="rounded-xl border p-3 space-y-2">
             <label class="text-sm font-semibold">อัปโหลดสลิป/แจ้งโอน</label>
@@ -877,7 +1373,11 @@ onMounted(() => {
               จัดการเมนู
             </button>
           </div>
-          <button class="rounded-lg border px-3 py-1.5" @click="ownerOpen = false">ปิด</button>
+          <div class="flex items-center gap-2">
+            <button class="rounded-lg border px-3 py-1.5" @click="openPrintPosters">พิมพ์ป้ายโต๊ะ</button>
+            <button v-if="ownerLoggedIn" class="rounded-lg border px-3 py-1.5" @click="logoutOwner">ออกจากระบบ</button>
+            <button class="rounded-lg border px-3 py-1.5" @click="ownerOpen = false">ปิด</button>
+          </div>
         </div>
 
         <!-- Dashboard -->
@@ -961,6 +1461,22 @@ onMounted(() => {
                 >
                   เปลี่ยนสถานะ
                 </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="pt-4">
+            <h4 class="font-extrabold text-ink mb-2">ลิงก์ & QR ต่อโต๊ะ</h4>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              <div v-for="t in tables" :key="'link-'+t.no" class="rounded-xl border p-3 bg-white">
+                <p class="font-bold">โต๊ะ {{ t.no }}</p>
+                <p class="text-xs text-slate-500 break-all mt-1">{{ getTableLink(t.no) }}</p>
+                <div class="mt-2 flex items-center gap-2">
+                  <button class="rounded-lg border px-2 py-1 text-sm" @click="copyLink(t.no)">คัดลอก</button>
+                  <button class="rounded-lg border px-2 py-1 text-sm" @click="openLink(t.no)">เปิด</button>
+                  <button class="rounded-lg border px-2 py-1 text-sm" @click="downloadQR(t.no)">ดาวน์โหลด QR</button>
+                </div>
+                <img :src="getTableQR(t.no)" alt="qr" class="mt-2 h-28 w-28" />
               </div>
             </div>
           </div>
@@ -1089,10 +1605,44 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.line-clamp-2 {
+.shadow-soft {
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.06);
+}
+
+/* Also define the standard property 'line-clamp' for compatibility */
+.clamp-2 {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  line-clamp: 2;
+}
+.print-grid-a4 {
+  /* default (screen) fallback; overridden in print */
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 10mm;
+  }
+  .print-grid-a4 {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 8mm !important;
+  }
+  .poster {
+    /* Avoid breaking posters across pages and force 2 rows per page */
+    break-inside: avoid;
+    page-break-inside: avoid;
+    height: calc((297mm - 20mm - 8mm) / 2); /* pageHeight - verticalMargins - one gap, divided by 2 */
+  }
+  .qr-img {
+    width: 60mm !important;
+    height: 60mm !important;
+  }
 }
 </style>
