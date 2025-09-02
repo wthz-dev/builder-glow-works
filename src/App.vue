@@ -616,6 +616,9 @@ function setOrderStatus(o: Order, s: Order['status']) {
   o.status = s
 }
 
+type OrderStatus = Order['status']
+const orderCols: OrderStatus[] = ['New', 'Paid', 'Cooking', 'Served', 'Canceled']
+
 const groupedOrders = computed(() => {
   const map: Record<Order['status'], Order[]> = {
     New: [],
@@ -1384,17 +1387,17 @@ onMounted(() => {
         <div v-if="ownerTab === 'dashboard'" class="p-4 space-y-6 overflow-y-auto">
           <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div
-              v-for="col in ['New', 'Paid', 'Cooking', 'Served', 'Canceled']"
+              v-for="col in orderCols"
               :key="col"
               class="rounded-xl bg-slate-50 p-3"
             >
               <div class="flex items-center justify-between mb-2">
                 <h4 class="font-extrabold text-ink">{{ col }}</h4>
-                <span class="text-xs text-slate-500">{{ groupedOrders[col].length }}</span>
+                <span class="text-xs text-slate-500">{{ groupedOrders[col as OrderStatus].length }}</span>
               </div>
               <div class="space-y-2 min-h-[60px]">
                 <div
-                  v-for="o in groupedOrders[col]"
+                  v-for="o in groupedOrders[col as OrderStatus]"
                   :key="o.id"
                   class="rounded-lg border bg-white p-3"
                 >
